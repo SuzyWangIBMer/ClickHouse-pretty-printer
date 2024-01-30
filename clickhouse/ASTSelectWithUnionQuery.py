@@ -11,7 +11,7 @@ class ASTSelectWithUnionQueryPrinter:
         type_name=gdb.execute(eval_string,   to_string=True).split('\n')[1].split("::")[1]
 
         #eval_string = "DB::queryToString(*("+str(self.val.type).strip('&')+"*)("+str(self.val.address)+"))"
-        eval_string = "DB::serializeAST(*(DB::"+type_name+" *)("+str(self.val.address)+"),  true)"
+        eval_string = "DB::serializeAST(*(DB::"+type_name+" *)("+str(self.val.address)+"))"+".c_str()"
         sql_string=gdb.parse_and_eval(eval_string)
 
         union_mode=self.val["union_mode"]
