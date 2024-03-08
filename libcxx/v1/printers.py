@@ -140,20 +140,43 @@ class StringPrinter:
             type = type.target()
 
         ss = pair_to_tuple(self.val['__r_'])[0]['__s']
-        __short_mask = int(self.val['__short_mask'])
-        if (ss['__size_'] & __short_mask) == 0:
-            len = ss['__size_'] >> 1 if __short_mask == 1 else ss['__size_']
-            ptr = ss['__data_']
+        if '__short_mask' in self.val.type.fields():
+            __short_mask = int(self.val['__short_mask'])
+            if (ss['__size_'] & __short_mask) == 0:
+                len = ss['__size_'] >> 1 if __short_mask == 1 else ss['__size_']
+                ptr = ss['__data_']
+            else:
+                sl = pair_to_tuple(self.val['__r_'])[0]['__l']
+                len = sl['__size_']
+                ptr = sl['__data_']
         else:
-            sl = pair_to_tuple(self.val['__r_'])[0]['__l']
-            len = sl['__size_']
-            ptr = sl['__data_']
+            if (ss['__is_long_']) == 0:
+                len = ss['__size_']
+                ptr = ss['__data_']
+            else:
+                sl = pair_to_tuple(self.val['__r_'])[0]['__l']
+                len = sl['__size_']
+                ptr = sl['__data_']
 
         return u''.join(chr(ptr[i]) for i in range(len))
 
     def display_hint(self):
         return 'string'
 
+class SmartPtrIterator(Iterator):
+    "An iterator for smart pointer types with a single 'child' value"
+
+    def __init__(self, val):
+        self.val = val
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.val is None:
+            raise StopIteration
+        self.val, val = None, self.val
+        return ('get()', val)
 
 class SharedPointerPrinter:
     "Print a shared_ptr or weak_ptr"
@@ -161,6 +184,10 @@ class SharedPointerPrinter:
     def __init__(self, typename, val):
         self.typename = typename
         self.val = val
+
+    def children (self):
+        v = self.val['__ptr_']
+        return SmartPtrIterator(v)
 
     def to_string(self):
         state = 'empty'
@@ -187,6 +214,10 @@ class UniquePointerPrinter:
     def __init__(self, typename, val):
         self.typename = typename
         self.val = val
+
+    def children (self):
+        v = pair_to_tuple(self.val['__ptr_'])[0]
+        return SmartPtrIterator(v)
 
     def to_string(self):
         v = pair_to_tuple(self.val['__ptr_'])[0]
@@ -246,6 +277,19 @@ class TuplePrinter:
         if len(self.val.type.fields()) == 0:
             return 'empty %s' % (self.typename)
         return 'tuple'
+
+
+class OptionalPrinter:
+    "Print a std::optional"
+
+    def __init__(self, typename, val):
+        self.typename = typename
+        self.val = val
+
+    def to_string(self):
+        if not self.val['__engaged_']:
+            return 'empty %s ' % (str(self.typename))
+        return '%s : %s' % (str(self.typename), self.val['__val_'].to_string())
 
 
 #    def display_hint(self):
@@ -412,8 +456,9 @@ class VectorPrinter:
             start = ptr_to_void_ptr(self.val['__begin_'])
             finish = ptr_to_void_ptr(self.val['__end_'])
             end = ptr_to_void_ptr(pair_to_tuple(self.val['__end_cap_'])[0])
-            length = finish - start
-            capacity = end - start
+            size_of_value_type = self.val.type.template_argument(0).sizeof
+            length = (finish - start) / size_of_value_type
+            capacity = (end - start) / size_of_value_type
             if length == 0:
                 return 'empty %s (capacity=%d)' % (self.typename,
                                                    int(capacity))
@@ -631,29 +676,34 @@ class RbtreeIterator(Iterator):
     def __len__(self):
         return int(self.size)
 
+    def get_tree_min (self, node) :
+        while node.dereference()['__left_'] :
+            node = node.dereference()['__left_']
+            pass
+        return node
+
+    def tree_is_left_child (self, node) :
+        parent_node = node.cast (self.node_pointer_type).dereference()['__parent_']
+        if node == parent_node.dereference() ['__left_'] :
+            return True
+        return False
+
     def __next__(self):
         if self.count == self.size:
             raise StopIteration
 
+        self.count += 1
         node = self.node.cast(self.node_pointer_type)
         result = node
-        self.count += 1
-        if self.count < self.size:
-            # Compute the next node.
-            if node.dereference()['__right_']:
-                node = node.dereference()['__right_']
-                while node.dereference()['__left_']:
-                    node = node.dereference()['__left_']
-            else:
-                parent_node = node.dereference()['__parent_']
-                while node != parent_node.dereference()['__left_']:
-                    node = parent_node
-                    parent_node = parent_node.dereference()['__parent_']
-                node = parent_node
-
-            self.node = node
+        # Compute the next node.
+        if node.dereference()['__right_'] :
+            self.node = self.get_tree_min (node.dereference()['__right_'])
+            return result
+        while node and (not self.tree_is_left_child (node)) :
+            node = node.cast (self.node_pointer_type).dereference()['__parent_']
+            pass
+        self.node = node.cast (self.node_pointer_type).dereference()['__parent_']
         return result
-
 
 class RbtreeIteratorPrinter:
     "Print std::set::iterator"
@@ -818,8 +868,11 @@ class UnorderedMapPrinter:
         result = []
         count = 0
         for elt in self.hashtableiter:
-            result.append(('[%d] %s' % (count, str(elt['__cc']['first'])),
-                           elt['__cc']['second']))
+            pair_type = str(elt.type.strip_typedefs()).replace('__hash_value_type', 'pair')
+            pair = elt.cast(gdb.lookup_type(pair_type))
+            result.append(('[%d] %s' % (count, str(pair['first'])), pair['second']))
+            #result.append(('[%d] %s' % (count, str(elt['__cc']['first'])),
+            #               elt['__cc']['second']))
             count += 1
         return result
 
@@ -1016,8 +1069,8 @@ def build_libcxx_dictionary():
     printer.add('stack', StackOrQueuePrinter)
     printer.add('unique_ptr', UniquePointerPrinter)
     printer.add('vector', VectorPrinter)  # Includes vector<bool>.
-    printer.add('shared_ptr', SharedPointerPrinter)
-    printer.add('weak_ptr', SharedPointerPrinter)
+    #printer.add('shared_ptr', SharedPointerPrinter)
+    #printer.add('weak_ptr', SharedPointerPrinter)
     printer.add('unordered_map', UnorderedMapPrinter)
     printer.add('unordered_set', UnorderedSetPrinter)
     printer.add('unordered_multimap', UnorderedMapPrinter)
@@ -1039,5 +1092,6 @@ def build_libcxx_dictionary():
     printer.add('__wrap_iter', VectorIteratorPrinter)
     printer.add('__bit_iterator', VectorBoolIteratorPrinter)
 
+    printer.add('optional', OptionalPrinter)
 
 build_libcxx_dictionary()
